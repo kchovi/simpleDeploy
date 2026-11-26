@@ -16,6 +16,7 @@ import json
 import queue
 import shutil
 import threading
+import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -86,23 +87,35 @@ def deploy_one(host, pkg, user, pw, encrypt, timeout_min, report):
         exe, args = build_command(pkg, remote_path)
         c = Client(host, username=user, password=pw, encrypt=encrypt)
         c.connect()
+        warn = ""
         try:
             c.create_service()
             out, err, rc = c.run_executable(
                 exe, arguments=args or None, use_system_account=True,
                 timeout_seconds=int(timeout_min * 60))
         finally:
+            # The runner service can stay locked for a moment after the installer
+            # exits. Retry, and never let a cleanup problem hide the real result.
+            for attempt in range(6):
+                try:
+                    c.remove_service()
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 5:
+                        warn = f" [cleanup warning: {type(e).__name__}; PAExec files may remain in C:\\Windows]"
+                    else:
+                        time.sleep(2)
             try:
-                c.remove_service()
-            finally:
                 c.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
         ok = rc in parse_codes(pkg.get("codes", "0,3010"))
         msg = "Success" if ok else "Failed"
         if rc == 3010:
             msg += " (reboot required)"
         if not ok and err:
             msg += ": " + err.decode(errors="replace").strip()[:200]
-        return ok, rc, msg
+        return ok, rc, msg + warn
     except Exception as e:  # noqa: BLE001 - show any failure in the GUI
         return False, None, f"{type(e).__name__}: {e}"[:300]
     finally:
@@ -284,6 +297,67 @@ class App:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+        # Copying: Ctrl+C, right-click menu, double-click for the full message
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Copy error / detail", command=lambda: self.copy_rows(self.tree.selection(), True))
+        self.menu.add_command(label="Copy row", command=lambda: self.copy_rows(self.tree.selection()))
+        self.menu.add_command(label="Copy all results", command=lambda: self.copy_rows(self.tree.get_children()))
+        self.menu.add_separator()
+        self.menu.add_command(label="Show full message…", command=self.show_detail)
+        self.tree.bind("<Control-c>", lambda e: self.copy_rows(self.tree.selection(), True))
+        self.tree.bind("<Double-1>", self.show_detail)
+        for btn in ("<Button-3>", "<Button-2>"):  # right-click (Windows/Linux, macOS)
+            self.tree.bind(btn, self.popup_menu)
+
+    # --- copying results
+    def copy_text(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()  # keeps the clipboard content after the window closes
+
+    def copy_rows(self, iids, detail_only=False):
+        lines = []
+        for i in iids:
+            v = self.tree.item(i, "values")
+            lines.append(str(v[3]) if detail_only else "\t".join(str(x) for x in v))
+        if lines:
+            self.copy_text("\n".join(lines))
+
+    def popup_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            if row not in self.tree.selection():
+                self.tree.selection_set(row)
+            try:
+                self.menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.menu.grab_release()
+
+    def show_detail(self, event=None):
+        row = self.tree.identify_row(event.y) if event is not None else (self.tree.selection() or [""])[0]
+        if not row:
+            return
+        host, status, code, detail = self.tree.item(row, "values")
+        win = tk.Toplevel(self.root)
+        win.title(f"{host}: {status}")
+        win.geometry("720x320")
+        win.configure(padx=12, pady=12)
+        dark = self.theme == "dark"
+        txt = tk.Text(win, wrap="word", relief="flat", borderwidth=0, padx=10, pady=8,
+                      background="#2b2b2b" if dark else "#ffffff",
+                      foreground="#f2f2f2" if dark else "#1f1f1f",
+                      insertbackground="#f2f2f2" if dark else "#1f1f1f",
+                      selectbackground="#0067c0", highlightthickness=0)
+        full = f"Host: {host}\nStatus: {status}\nExit code: {code}\n\n{detail}"
+        txt.insert("1.0", full)
+        txt.configure(state="disabled")  # selectable and copyable, not editable
+        txt.pack(fill="both", expand=True)
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Button(bar, text="Copy", style=ACCENT, command=lambda: self.copy_text(full)).pack(side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="left", padx=8)
+        txt.focus_set()
 
     def apply_colors(self):
         dark = self.theme == "dark"
